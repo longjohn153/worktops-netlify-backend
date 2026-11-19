@@ -6,6 +6,30 @@ const crypto = require('crypto');
 
 const API_VERSION = process.env.SHOPIFY_API_VERSION || '2026-04';
 
+async function getShopifyAccessToken() {
+  const shop = String(process.env.SHOPIFY_SHOP || '').trim().replace(/\.myshopify\.com$/i, '');
+  const clientId = process.env.SHOPIFY_CLIENT_ID || '';
+  const clientSecret = process.env.SHOPIFY_CLIENT_SECRET || '';
+  if (!shop || !clientId || !clientSecret) throw new Error('Missing SHOPIFY_SHOP / SHOPIFY_CLIENT_ID / SHOPIFY_CLIENT_SECRET');
+
+  const body = new URLSearchParams({
+    grant_type: 'client_credentials',
+    client_id: clientId,
+    client_secret: clientSecret
+  });
+
+  const response = await fetch(`https://${shop}.myshopify.com/admin/oauth/access_token`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: body.toString()
+  });
+  const data = await response.json();
+  if (!response.ok || !data.access_token) {
+    throw new Error('Shopify authentication failed: ' + JSON.stringify(data));
+  }
+  return { shop: `${shop}.myshopify.com`, accessToken: data.access_token };
+}
+
 function html(status, title, message) {
   return {
     statusCode: status,
@@ -34,7 +58,7 @@ function verifyToken(token, secret) {
   const payload = JSON.parse(b64urlDecode(encoded).toString('utf8'));
   if (!payload.exp || payload.exp < Math.floor(Date.now() / 1000)) throw new Error('This payment link has expired');
   if (!payload.quoteRef || !payload.customer || !payload.product) throw new Error('Payment link is incomplete');
-  if (!['full', 'half'].includes(payload.mode)) throw new Error('Unknown payment option');
+  if (!['full', 'deposit'].includes(payload.mode)) throw new Error('Unknown payment option');
   const amount = Number(payload.amount);
   const total = Number(payload.total);
   if (!Number.isFinite(amount) || amount <= 0 || !Number.isFinite(total) || total <= 0 || amount > total) throw new Error('Invalid payment amount');
@@ -49,12 +73,17 @@ exports.handler = async function(event) {
   if (event.httpMethod !== 'GET') return html(405, 'Method not allowed', 'Please use the payment button in your quote email.');
 
   const secret = process.env.QUOTE_PAYMENT_SECRET || '';
-  const shop = cleanShopDomain(process.env.SHOPIFY_STORE_DOMAIN || process.env.SHOPIFY_SHOP_DOMAIN || process.env.SHOPIFY_STORE || '');
-  const accessToken = process.env.SHOPIFY_TOKEN || process.env.SHOPIFY_ADMIN_ACCESS_TOKEN || process.env.SHOPIFY_ACCESS_TOKEN || '';
-
-  if (!secret || !shop || !accessToken) {
-    console.error('Missing QUOTE_PAYMENT_SECRET / Shopify environment variables');
+  if (!secret) {
+    console.error('Missing QUOTE_PAYMENT_SECRET');
     return html(503, 'Payment setup is not complete', 'Please contact Worktops.net on 0330 088 3391 or sales@worktops.net and quote your reference number.');
+  }
+
+  let shop, accessToken;
+  try {
+    ({ shop, accessToken } = await getShopifyAccessToken());
+  } catch (err) {
+    console.error(err.message);
+    return html(503, 'Payment setup is not complete', 'Shopify authentication is not ready yet. Please contact Worktops.net and quote your reference number.');
   }
 
   let payload;
@@ -68,7 +97,7 @@ exports.handler = async function(event) {
   const amount = Math.round(Number(payload.amount) * 100) / 100;
   const total = Math.round(Number(payload.total) * 100) / 100;
   const balance = Math.round(Number(payload.balance || 0) * 100) / 100;
-  const modeLabel = payload.mode === 'full' ? 'Full payment' : '50% deposit';
+  const modeLabel = payload.mode === 'full' ? 'Full payment' : 'Initial 10% payment toward 50% deposit';
   const customerName = [payload.customer.firstName, payload.customer.lastName].filter(Boolean).join(' ');
 
   const mutation = `mutation DraftOrderCreate($input: DraftOrderInput!) {
