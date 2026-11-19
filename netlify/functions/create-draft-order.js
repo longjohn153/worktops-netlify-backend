@@ -1,3 +1,27 @@
+
+async function getShopifyAccessToken() {
+  const shop = String(process.env.SHOPIFY_SHOP || '').trim().replace(/\.myshopify\.com$/i, '');
+  const clientId = process.env.SHOPIFY_CLIENT_ID || '';
+  const clientSecret = process.env.SHOPIFY_CLIENT_SECRET || '';
+  if (!shop || !clientId || !clientSecret) throw new Error('Missing SHOPIFY_SHOP / SHOPIFY_CLIENT_ID / SHOPIFY_CLIENT_SECRET');
+
+  const body = new URLSearchParams({
+    grant_type: 'client_credentials',
+    client_id: clientId,
+    client_secret: clientSecret
+  });
+
+  const response = await fetch(`https://${shop}.myshopify.com/admin/oauth/access_token`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: body.toString()
+  });
+  const data = await response.json();
+  if (!response.ok || !data.access_token) {
+    throw new Error('Shopify authentication failed: ' + JSON.stringify(data));
+  }
+  return { shop: `${shop}.myshopify.com`, accessToken: data.access_token };
+}
 exports.handler = async function(event) {
   const headers = {
     'Access-Control-Allow-Origin': '*',
@@ -18,8 +42,7 @@ exports.handler = async function(event) {
       if (!data[field]) return { statusCode: 400, headers, body: JSON.stringify({ error: 'Missing: ' + field }) };
     }
 
-    const SHOPIFY_STORE = process.env.SHOPIFY_STORE;
-    const SHOPIFY_TOKEN = process.env.SHOPIFY_TOKEN;
+    const { shop: SHOPIFY_STORE, accessToken: SHOPIFY_TOKEN } = await getShopifyAccessToken();
 
     const note = [
       'Quote Reference: ' + data.quoteRef,
@@ -27,7 +50,7 @@ exports.handler = async function(event) {
       'Thickness: ' + (data.thickness || ''),
       'Total Area: ' + (data.area || '') + ' m2',
       'Total Quotation (inc VAT): GBP' + data.totalAmount.toFixed(2),
-      'Deposit (10%): GBP' + data.depositAmount.toFixed(2),
+      'Initial payment (10% toward 50% deposit): GBP' + data.depositAmount.toFixed(2),
       'Balance Due: GBP' + data.balanceAmount.toFixed(2),
       'Polished Edges: ' + (data.edges || 'None'),
       'Cut-outs: ' + (data.cutouts || 'None'),
@@ -56,7 +79,7 @@ exports.handler = async function(event) {
     const variables = {
       input: {
         lineItems: [{
-          title: 'Worktop Deposit - ' + data.productTitle,
+          title: 'Worktop Initial Deposit Payment - ' + data.productTitle,
           originalUnitPrice: data.depositAmount.toFixed(2),
           quantity: 1,
           requiresShipping: false,
