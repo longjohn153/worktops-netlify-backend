@@ -1,4 +1,3 @@
-
 // netlify/functions/send-estimate.js
 //
 // Receives a POST from the instant-quote page when the customer clicks
@@ -32,15 +31,20 @@
 //   RESEND_API_KEY           Resend API key (sending domain: worktops.net)
 //   RESEND_INTERNAL_EMAIL    team inbox for internal estimate notifications
 //                            (optional — defaults to sales@worktops.net)
+//   QUOTE_PAYMENT_SECRET     long random secret shared with quote-payment.js
+//   QUOTE_PAYMENT_BASE_URL   optional payment function URL override
 //
 // Klaviyo API ref: https://developers.klaviyo.com/en/reference/api_overview
 // Resend API ref:  https://resend.com/docs/api-reference/emails/send-email
+
+const crypto = require('crypto');
 
 const KLAVIYO_API_BASE = 'https://a.klaviyo.com/api';
 const KLAVIYO_REVISION = '2024-10-15';
 const RESEND_API_BASE = 'https://api.resend.com';
 const RESEND_FROM = 'Worktops.net <quotes@worktops.net>';
 const DEFAULT_INTERNAL_EMAIL = 'sales@worktops.net';
+const DEFAULT_PAYMENT_BASE_URL = 'https://resplendent-starburst-6c342e.netlify.app/.netlify/functions/quote-payment';
 
 exports.handler = async function (event) {
   const headers = {
@@ -460,9 +464,52 @@ function pieceDimsStr(dims) {
   return out;
 }
 
+
+function b64url(input) {
+  return Buffer.from(input).toString('base64')
+    .replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/g, '');
+}
+
+function makePaymentUrl(data, mode) {
+  const secret = process.env.QUOTE_PAYMENT_SECRET || '';
+  if (!secret) {
+    return 'mailto:sales@worktops.net?subject=' + encodeURIComponent('Proceed with quote ' + (data.meta.quote_ref || ''));
+  }
+
+  const total = Math.round((Number(data.pricing.total_inc_vat) || 0) * 100) / 100;
+  const amount = mode === 'full' ? total : Math.round(total * 10) / 100;
+  const balance = Math.round((total - amount) * 100) / 100;
+  const payload = {
+    v: 1,
+    exp: Math.floor(Date.now() / 1000) + (30 * 24 * 60 * 60),
+    quoteRef: String(data.meta.quote_ref || ''),
+    mode: mode,
+    amount: amount,
+    total: total,
+    balance: balance,
+    customer: {
+      firstName: String(data.customer.first_name || ''),
+      lastName: String(data.customer.last_name || ''),
+      email: String(data.customer.email || ''),
+      phone: String(data.customer.phone || ''),
+      postcode: String(data.customer.postcode || '')
+    },
+    product: {
+      title: String(data.product.title || 'Worktop order'),
+      thickness: String(data.product.thickness || ''),
+      area: Number(data.measurements.total_area_m2) || 0
+    }
+  };
+  const encoded = b64url(JSON.stringify(payload));
+  const sig = crypto.createHmac('sha256', secret).update(encoded).digest('base64')
+    .replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/g, '');
+  const base = process.env.QUOTE_PAYMENT_BASE_URL || DEFAULT_PAYMENT_BASE_URL;
+  return base + '?token=' + encodeURIComponent(encoded + '.' + sig);
+}
+
 function customerSubject(data) {
   const first = data.customer.first_name || 'there';
-  return 'Your worktop estimate is ready, ' + first + ' \u2014 quote ' + (data.meta.quote_ref || '');
+  return 'Your Worktops.net quote is ready, ' + first + ' \u2014 ' + (data.meta.quote_ref || '');
 }
 
 function internalSubject(data) {
@@ -486,6 +533,12 @@ function buildCustomerEmailHtml(data) {
   const productImage = esc(p.image_url) || 'https://www.worktops.net/cdn/shop/files/homepage-image.jpg?v=1751037870&width=400';
   const productType = esc(p.type) || 'Worktop';
   const productThickness = esc(p.thickness) || '&mdash;';
+  const totalAmount = Math.round((Number(pr.total_inc_vat) || 0) * 100) / 100;
+  const depositAmount = Math.round(totalAmount * 10) / 100;
+  const remainingDepositAmount = Math.round(totalAmount * 40) / 100;
+  const postDepositBalance = Math.round(totalAmount * 50) / 100;
+  const fullPaymentUrl = makePaymentUrl(data, 'full');
+  const depositPaymentUrl = makePaymentUrl(data, 'deposit');
 
   const productUrlBlock = p.product_url ? `
     <p style="margin:14px 0 0 0; font-size:13px; line-height:18px;">
@@ -559,6 +612,40 @@ function buildCustomerEmailHtml(data) {
     <table border="0" cellpadding="0" cellspacing="0" role="presentation" style="margin-top:12px; font-family: Arial, Helvetica, sans-serif; font-size:13px; line-height:20px; color:#6b6b6b;" width="100%">
       ${piecesListRows}
     </table>` : '';
+
+  const compactPieceList = pieces.slice(0, 3).map((piece) => `${esc(piece.label)}${pieceDimsStr(piece.dims)} mm`).join('<br/>');
+  const extraPieceCount = Math.max(0, pieces.length - 3);
+  const compactExtras = [
+    (m.polished_edges_m > 0) ? `${money(m.polished_edges_m)} m polished edges` : '',
+    (m.polished_cutouts > 0) ? `${esc(m.polished_cutouts)} polished cut-out${m.polished_cutouts === 1 ? '' : 's'}` : '',
+    (m.unpolished_cutouts > 0) ? `${esc(m.unpolished_cutouts)} unpolished cut-out${m.unpolished_cutouts === 1 ? '' : 's'}` : '',
+    (m.drainer_grooves_sets > 0) ? `${esc(m.drainer_grooves_sets)} drainer groove set${m.drainer_grooves_sets === 1 ? '' : 's'}` : '',
+    (m.upstands_m > 0) ? `${money(m.upstands_m)} m upstands` : '',
+    (m.splashbacks_m > 0) ? `${money(m.splashbacks_m)} m splashbacks` : '',
+    (m.waterfall_m > 0) ? `${money(m.waterfall_m)} m waterfall edges` : ''
+  ].filter(Boolean).join(' &middot; ');
+
+  const overviewRows = [
+    `<tr><td style="padding:6px 0; color:#6b6b6b; width:150px; vertical-align:top;">Quote reference</td><td style="padding:6px 0;"><strong>${esc(meta.quote_ref)}</strong></td></tr>`,
+    `<tr><td style="padding:6px 0; color:#6b6b6b; vertical-align:top;">Thickness</td><td style="padding:6px 0;"><strong>${productThickness}</strong></td></tr>`,
+    `<tr><td style="padding:6px 0; color:#6b6b6b; vertical-align:top;">Total area</td><td style="padding:6px 0;"><strong>${(Number(m.total_area_m2) || 0).toFixed(2)} m&sup2;</strong></td></tr>`,
+    `<tr><td style="padding:6px 0; color:#6b6b6b; vertical-align:top;">Pieces</td><td style="padding:6px 0;"><strong>${pieces.length}</strong>${compactPieceList ? `<div style="margin-top:4px; color:#2c2c2c;">${compactPieceList}${extraPieceCount ? `<br/><span style=\"color:#6b6b6b;\">+ ${extraPieceCount} more piece${extraPieceCount === 1 ? '' : 's'}</span>` : ''}</div>` : ''}</td></tr>`,
+    compactExtras ? `<tr><td style="padding:6px 0; color:#6b6b6b; vertical-align:top;">Extras</td><td style="padding:6px 0;"><strong>${compactExtras}</strong></td></tr>` : '',
+    m.quooker_tap ? `<tr><td style="padding:6px 0; color:#6b6b6b; vertical-align:top;">Quooker</td><td style="padding:6px 0;"><strong>${esc(m.quooker_tap.product)}, ${esc(m.quooker_tap.colour)}, ${esc(m.quooker_tap.tank)}${m.quooker_cube ? ' + CUBE' : ''}</strong></td></tr>` : ''
+  ].filter(Boolean).join('');
+
+  const overviewBlock = `
+    <table border="0" cellpadding="0" cellspacing="0" role="presentation" style="background-color:#ffffff; border:1px solid #e8e2d4;" width="100%">
+      <tr>
+        <td style="padding:20px 22px; font-family:Arial, Helvetica, sans-serif;">
+          <p style="margin:0 0 8px 0; font-size:11px; line-height:15px; letter-spacing:1.4px; text-transform:uppercase; color:#9a8c6e; font-weight:bold;">At a glance</p>
+          <p style="margin:0 0 14px 0; font-size:14px; line-height:20px; color:#2c2c2c;">A quick overview of the details you entered.</p>
+          <table border="0" cellpadding="0" cellspacing="0" role="presentation" style="font-size:14px; line-height:20px; color:#2c2c2c;" width="100%">
+            ${overviewRows}
+          </table>
+        </td>
+      </tr>
+    </table>`;
 
   const discountBlock = (pr.discount_inc_vat > 0) ? `
     <tr>
@@ -678,6 +765,9 @@ function buildCustomerEmailHtml(data) {
             </td>
           </tr>
           <tr>
+            <td class="px-mobile" style="padding:0 32px 24px 32px;">${overviewBlock}</td>
+          </tr>
+          <tr>
             <td class="px-mobile" style="padding:0 32px 24px 32px;">
               <h3 style="margin:0 0 12px 0; font-family: Georgia, 'Times New Roman', serif; font-size:18px; line-height:22px; color:#1f3a5f; font-weight:normal; border-bottom:2px solid #e8e2d4; padding-bottom:8px;">Your specification</h3>
               <table border="0" cellpadding="0" cellspacing="0" role="presentation" style="font-family: Arial, Helvetica, sans-serif; font-size:14px; line-height:22px; color:#2c2c2c;" width="100%">
@@ -721,8 +811,8 @@ function buildCustomerEmailHtml(data) {
                       </tr>
                       <tr>
                         <td colspan="2" style="padding-top:14px; font-family: Arial, Helvetica, sans-serif; font-size:13px; line-height:18px; color:#c9d4e4;">
-                          10% deposit to confirm: <strong style="color:#ffffff;">&pound;${money(pr.deposit_amount)}</strong>
-                          &nbsp;&middot;&nbsp; Balance: &pound;${money(pr.balance_amount)}
+                          Pay in full: <strong style="color:#ffffff;">&pound;${money(totalAmount)}</strong>
+                          &nbsp;&middot;&nbsp; 10% initial payment: <strong style="color:#ffffff;">&pound;${money(depositAmount)}</strong>
                         </td>
                       </tr>
                     </table>
@@ -739,13 +829,41 @@ function buildCustomerEmailHtml(data) {
             </td>
           </tr>
           <tr>
-            <td align="center" class="px-mobile" style="padding:8px 32px 32px 32px;">
-              <p style="margin:0; font-family:Arial,Helvetica,sans-serif; font-size:15px; line-height:24px; color:#2c2c2c; text-align:center;">
-                To continue with your order call us on
-                <a href="tel:+443300883391" style="color:#1f3a5f; font-weight:bold; text-decoration:none;">0330 088 3391</a>
-                to discuss, or email us at
-                <a href="mailto:sales@worktops.net" style="color:#1f3a5f; font-weight:bold; text-decoration:none;">sales@worktops.net</a>
-              </p>
+            <td class="px-mobile" style="padding:8px 32px 30px 32px;">
+              <table border="0" cellpadding="0" cellspacing="0" role="presentation" style="background-color:#faf8f4; border:1px solid #e8e2d4;" width="100%">
+                <tr><td align="center" style="padding:26px 22px 10px 22px; font-family:Arial,Helvetica,sans-serif;">
+                  <p style="margin:0 0 6px 0; font-size:11px; line-height:15px; letter-spacing:1.4px; text-transform:uppercase; color:#9a8c6e; font-weight:bold;">Ready to proceed?</p>
+                  <h3 style="margin:0 0 8px 0; font-family:Georgia,'Times New Roman',serif; font-size:24px; line-height:30px; color:#1f3a5f; font-weight:normal;">Choose how you&apos;d like to pay</h3>
+                  <p style="margin:0; font-size:14px; line-height:21px; color:#606060;">Secure checkout is completed through Shopify. Your quote reference is ${esc(meta.quote_ref)}.</p>
+                </td></tr>
+                <tr><td style="padding:12px 18px 8px 18px;">
+                  <table border="0" cellpadding="0" cellspacing="0" role="presentation" width="100%"><tr>
+                    <td class="stack-half" valign="top" width="50%" style="padding:0 6px 10px 0;">
+                      <table border="0" cellpadding="0" cellspacing="0" role="presentation" style="background:#ffffff; border:1px solid #ded7c7;" width="100%"><tr><td align="center" style="padding:22px 14px; font-family:Arial,Helvetica,sans-serif;">
+                        <p style="margin:0 0 6px 0; font-size:12px; letter-spacing:1px; text-transform:uppercase; color:#9a8c6e; font-weight:bold;">Pay in full</p>
+                        <p style="margin:0 0 5px 0; font-family:Georgia,'Times New Roman',serif; font-size:27px; line-height:32px; color:#1f3a5f; font-weight:bold;">&pound;${money(totalAmount)}</p>
+                        <p style="margin:0 0 16px 0; font-size:13px; line-height:19px; color:#6b6b6b;">Pay the full quotation amount today.</p>
+                        <table border="0" cellpadding="0" cellspacing="0" role="presentation"><tr><td bgcolor="#1f3a5f" style="border-radius:2px;"><a href="${esc(fullPaymentUrl)}" style="display:inline-block; padding:13px 20px; font-size:14px; line-height:18px; color:#ffffff; text-decoration:none; font-weight:bold;">Pay in full &rarr;</a></td></tr></table>
+                      </td></tr></table>
+                    </td>
+                    <td class="stack-half" valign="top" width="50%" style="padding:0 0 10px 6px;">
+                      <table border="0" cellpadding="0" cellspacing="0" role="presentation" style="background:#ffffff; border:1px solid #ded7c7;" width="100%"><tr><td align="center" style="padding:22px 14px; font-family:Arial,Helvetica,sans-serif;">
+                        <p style="margin:0 0 6px 0; font-size:12px; letter-spacing:1px; text-transform:uppercase; color:#9a8c6e; font-weight:bold;">Pay 10% now</p>
+                        <p style="margin:0 0 5px 0; font-family:Georgia,'Times New Roman',serif; font-size:27px; line-height:32px; color:#1f3a5f; font-weight:bold;">&pound;${money(depositAmount)}</p>
+                        <p style="margin:0 0 16px 0; font-size:13px; line-height:19px; color:#6b6b6b;">This is the first part of your 50% deposit. A further 40% (&pound;${money(remainingDepositAmount)}) is due before templating. The remaining 50% (&pound;${money(postDepositBalance)}) is payable later in the order process.</p>
+                        <table border="0" cellpadding="0" cellspacing="0" role="presentation"><tr><td bgcolor="#1f3a5f" style="border-radius:2px;"><a href="${esc(depositPaymentUrl)}" style="display:inline-block; padding:13px 20px; font-size:14px; line-height:18px; color:#ffffff; text-decoration:none; font-weight:bold;">Pay 10% now &rarr;</a></td></tr></table>
+                      </td></tr></table>
+                    </td>
+                  </tr></table>
+                </td></tr>
+                <tr><td align="center" style="padding:8px 22px 24px 22px; font-family:Arial,Helvetica,sans-serif;">
+                  <table border="0" cellpadding="0" cellspacing="0" role="presentation" style="background:#f0ede6; border:1px dashed #c9c0a8;" width="100%"><tr><td align="center" style="padding:16px;">
+                    <p style="margin:0 0 3px 0; font-size:13px; font-weight:bold; color:#1f3a5f;">Finance options coming soon</p>
+                    <p style="margin:0; font-size:12px; line-height:18px; color:#6b6b6b;">We&apos;ll add Affirm here later so customers can spread the cost.</p>
+                  </td></tr></table>
+                  <p style="margin:16px 0 0 0; font-size:13px; line-height:20px; color:#606060;">Prefer to speak to us first? Call <a href="tel:+443300883391" style="color:#1f3a5f; font-weight:bold; text-decoration:none;">0330 088 3391</a> or email <a href="mailto:sales@worktops.net" style="color:#1f3a5f; font-weight:bold; text-decoration:none;">sales@worktops.net</a>.</p>
+                </td></tr>
+              </table>
             </td>
           </tr>
           <tr>
