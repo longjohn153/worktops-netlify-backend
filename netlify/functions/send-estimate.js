@@ -27,7 +27,7 @@
 //
 // Env vars required:
 //   KLAVIYO_API_KEY          private key, scope: profiles+events+lists+metrics
-//   KLAVIYO_LIST_ID          the Email List ID (currently: Yp6ypR)
+//   KLAVIYO_LIST_ID          the Email List ID
 //   RESEND_API_KEY           Resend API key (sending domain: worktops.net)
 //   RESEND_INTERNAL_EMAIL    team inbox for internal estimate notifications
 //                            (optional — defaults to sales@worktops.net)
